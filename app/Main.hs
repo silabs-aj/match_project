@@ -407,7 +407,75 @@ readSegFromFASTA spec = do
           slice <- readFastaSlice fp nm start1 l
           -- 'slice' already normalized to A/C/G/T/N; 'cleanDNA' is safe but optional
           pure (cleanDNA slice)
+-----------------------------------------------------------------------------
+-- Streaming FASTA validator (useful for very large hg38.fa.gz files)
 
+data FastaValidation = FastaValidation
+  { fvContigs            :: !Int
+  , fvBases              :: !Int
+  , fvNonACGTN           :: !Int
+  , fvSeqLinesNoHeader   :: !Int
+  } deriving (Show)
+
+validateFastaLikeHg38 :: FilePath -> IO FastaValidation
+validateFastaLikeHg38 fp =
+  runResourceT $
+    C.runConduit $
+         sourcePossiblyGzip fp
+    C..| CB.lines
+    C..| sinkValidate
+  where
+    sinkValidate :: Monad m => C.ConduitT BS.ByteString o m FastaValidation
+    sinkValidate = go False 0 0 0 0
+
+    go inHeaderSeen !contigs !bases !nonACGTN !seqLinesNoHeader = do
+      mLine0 <- C.await
+      case mLine0 of
+        Nothing ->
+          pure (FastaValidation contigs bases nonACGTN seqLinesNoHeader)
+        Just ln0 -> do
+          let ln = stripCR ln0
+          if BS.null ln
+            then go inHeaderSeen contigs bases nonACGTN seqLinesNoHeader
+            else if B8.head ln == '>'
+              then
+                let name = B8.takeWhile (not . isSpace) (BS.tail ln)
+                in if BS.null name
+                     then go True contigs bases nonACGTN (seqLinesNoHeader + 1)
+                     else go True (contigs + 1) bases nonACGTN seqLinesNoHeader
+              else
+                let lineLen = BS.length ln
+                    badHere = BS.length (B8.filter (not . isDNAChar) ln)
+                    seqLinesNoHeader' = if inHeaderSeen then seqLinesNoHeader else seqLinesNoHeader + 1
+                in go inHeaderSeen contigs (bases + lineLen) (nonACGTN + badHere) seqLinesNoHeader'
+
+    isDNAChar c =
+      case toUpper c of
+        'A' -> True
+        'C' -> True
+        'G' -> True
+        'T' -> True
+        'N' -> True
+        _   -> False
+
+runValidateHg38 :: [String] -> IO ()
+runValidateHg38 args = do
+  let fp = case args of
+             []      -> "hg38.fa.gz"
+             [one]   -> one
+             _       -> error "Usage: validate-hg38 [<hg38.fa.gz>]"
+  v <- validateFastaLikeHg38 fp
+  putStrLn ("validate-hg38 file: " ++ fp)
+  putStrLn ("contigs: " ++ show (fvContigs v))
+  putStrLn ("bases: " ++ show (fvBases v))
+  putStrLn ("non-ACGTN bases: " ++ show (fvNonACGTN v))
+  putStrLn ("sequence lines without header: " ++ show (fvSeqLinesNoHeader v))
+  when (fvContigs v <= 0) $ fail "validation failed: no FASTA headers found"
+  when (fvSeqLinesNoHeader v > 0) $ fail "validation failed: sequence lines encountered before a valid header"
+  when (fvNonACGTN v > 0) $
+    putStrLn "warning: non-ACGTN symbols present; readFastaSlice will normalize these to 'N'"
+
+-------------------------------------------------------------------------
 -----------------------------------------------------------------------------
 -- Vector-KMP across contigs (absolute positions with +coff)
 kmpAllContigs :: Env -> [(BS.ByteString, Int)]
@@ -459,18 +527,19 @@ loadLibraryROI fp (ROIRange nm s1 l) = do
   slice <- readFastaSlice fp nm s1 l
   when (BS.null slice) $
     fail ("ROI slice is empty; check contig name and coordinates: " ++ B8.unpack nm)
+  putStrLn $ "nm : " ++ show nm ++ " s1 = " ++ show s1 
   pure [ Contig nm slice (toVecBS slice) (max 0 (s1 - 1)) ]
 
 -----------------------------------------------------------------------------
 -- Build the Env
 setupEnv :: Maybe FilePath -> Maybe String -> Maybe RegionSpec -> IO Env
 setupEnv mLib mSeg mROI = do
-  putStrLn $ "mLib File Name: " ++ show mLib
+  putStrLn $ "mLib File Name: " ++ show mLib ++ " mSeg =" ++ show mSeg ++ " mROI = " ++ show mROI
   conts0 <-
     case (mLib, mROI) of
       (Nothing , _)                          -> syntheticLibrary
-      (Just fp , Just r@(ROIRange _ _ _))    -> trace ("fp = " ++ show fp ++ "  fp = " ++ show r) $ loadLibraryROI fp r
-      (Just fp , _                        )  -> loadLibrary fp
+      (Just fp , Just r@(ROIRange _ _ _))    -> loadLibraryROI fp r
+      (Just fp , _)                          -> loadLibrary fp
   let conts = conts0
   seg <- maybe (pure (B8.pack "ACGTACGTAC")) readSegmentArg mSeg
   let seg' = cleanDNA seg
@@ -502,13 +571,13 @@ runFind args = do
 runFindWithROI :: Maybe RegionSpec -> [String] -> IO ()
 runFindWithROI mROI args = do
   env <- case args of
-           [lib, seg] -> setupEnv (Just lib) (Just seg) mROI
+           [lib, seg] -> trace ("seg : " ++ show seg) $ setupEnv (Just lib) (Just seg) mROI
            [seg]      -> setupEnv Nothing (Just seg) mROI
            []         -> setupEnv Nothing Nothing mROI
            _          -> fail "Usage: find [--roi contig:start+len] [<library.fasta>] <segment|@segment.fasta>"
-  let matches = kmpAllContigs env
+--  let matches = kmpAllContigs env
 
---  let matches = repAllContigs env
+  let matches = repAllContigs env
   mapM_ (\(nm, pAbs) -> B8.putStrLn (nm <> B8.pack "\t" <> B8.pack (show pAbs))) matches
   B8.putStrLn (B8.pack ("# total matches: " ++ show (length matches)))
 
@@ -549,7 +618,7 @@ parseROIRange s =
 parseArgsROI :: [String] -> Either String (Maybe RegionSpec, [String])
 parseArgsROI = go Nothing []
   where
-    go m acc [] = Right (m, reverse acc)
+    go m acc [] = trace (" m " ++ show m ++ " acc = " ++ show (reverse acc)) $ Right (m, reverse acc)
     go m acc ("--roi":spec:xs) =
       case parseROIRange spec of
         Left e  -> Left ("--roi parse error: " ++ e)
@@ -579,6 +648,7 @@ main = do
       Left e -> fail e
       Right (mROI,positional) ->
         case positional of
+          ("validate-hg38":rest) -> runValidateHg38 rest
           ("find":rest) -> do
             before <- getCurrentTime
             runFindWithROI mROI rest
